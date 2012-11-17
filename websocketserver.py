@@ -1,53 +1,161 @@
-import uuid
+import os
+import time
 import Queue
 import logging
 import threading
 
-import tornado.escape
 import tornado.ioloop
 import tornado.options
 import tornado.web
 import tornado.websocket
-import os.path
 
 import Leap
+import simplejson as json
 
-tornado.options.define("port", default=8888, help="run on the given port", type=int)
+logger = logging.getLogger(__name__)
 
-class EventThread(threading.Thread):
-    def __init__(self, event_queue):
-        threading.Thread.__init__()
+class LeapJSONEncoder(json.JSONEncoder):
+    """
+    JSONEncoder subclass that knows how to serialize leap swig things
+    """
+    def default(self, o):
+        if isinstance(o, Leap.Vector):
+            return {
+                "x": o.x,
+                "y":o.y,
+                "z":o.z,
+            }
+        elif isinstance(o, Leap.Ray):
+            return {
+                "position":o.position,
+                "direction":o.direction,
+            }
+        elif isinstance(o, Leap.Ball):
+            return {
+                "position":o.position,
+                "radius":o.radius,
+            }
+        elif isinstance(o, Leap.Finger):
+            return {
+                'id': o.id(),
+                'tip': o.tip(),
+                'velocity': o.velocity(),
+                'width': o.width(),
+                'length': o.length(),
+                'isTool': o.isTool(),
+            }
+        elif isinstance(o, Leap.Hand):
+            return {
+                'id': o.id(),
+                'fingers': o.fingers(),
+                'palm': o.palm(),
+                'velocity': o.velocity(),
+                'normal': o.normal(),
+                'ball': o.ball(),
+            }
+        elif isinstance(o, Leap.Frame):
+            return {
+                'id': o.id(),
+                'timestamp': o.timestamp(),
+                'hands': o.hands(),
+            }
+        else:
+            return super(LeapJSONEncoder, self).default(o)
+
+
+class LListener(Leap.Listener):
+    """
+    Listener to throw things on a queue
+    """
+    def __init__(self, event_queue, *args, **kwargs):
+        super(LListener, self).__init__(*args, **kwargs)
         self.event_queue = event_queue
+
+    def try_put(self, msg):
+        assert isinstance(msg, dict)
+        try:
+            self.event_queue.put(msg, block=False)
+        except Queue.Full:
+            pass
+
+    def onInit(self, controller):
+        self.try_put(
+            {
+                "state":"initialized"
+            }
+        )
+
+    def onConnect(self, controller):
+        self.try_put(
+            {
+                "state":"connected"
+            }
+        )
+
+    def onDisconnect(self, controller):
+        self.try_put(
+            {
+                "state":"disconnected"
+            }
+        )
+
+    def onFrame(self, controller):
+        self.try_put(
+            {
+                "state": "frame",
+                "frame": controller.frame(),
+            }
+        )
+
+
+class LeapThread(threading.Thread):
+    def __init__(self, event_queue):
+        threading.Thread.__init__(self)
         self.daemon = True
-    
+        self.event_queue = event_queue
+
     def run(self):
-        pass
+        self.listener = LListener(self.event_queue)
+        self.controller = Leap.Controller(self.listener)
+        while 1:
+            time.sleep(1)
+        self.controller = None
+
 
 class Application(tornado.web.Application):
     def __init__(self):
+        self.lsh = LeapSocketHandler
         handlers = [
             (r"/", MainHandler),
-            (r"/leap", LeapSocketHandler),
+            (r"/leapsocket", self.lsh),
         ]
-        settings = dict(
-            cookie_secret="__TODO:_GENERATE_YOUR_OWN_RANDOM_VALUE_HERE__",
-            template_path=os.path.join(os.path.dirname(__file__), "templates"),
-            static_path=os.path.join(os.path.dirname(__file__), "static"),
-            xsrf_cookies=True,
-            autoescape=None,
-        )
+        settings = {
+            'static_path': os.path.join(os.path.dirname(__file__), "static"),
+        }
         tornado.web.Application.__init__(self, handlers, **settings)
+
         self.event_queue = Queue.Queue()
+        self.leap_thread = LeapThread(self.event_queue)
+        tornado.ioloop.PeriodicCallback(self._poll_for_leap_events, 1).start()
+        self.leap_thread.start() # kick off our data gathering thread
+
+    def _poll_for_leap_events(self):
+        try:
+            d = self.event_queue.get(block=False)
+            logger.debug("pending event queue size: %i", self.event_queue.qsize())
+            self.lsh.send_updates(json.dumps(d, cls=LeapJSONEncoder))
+            self.event_queue.task_done()
+        except Queue.Empty:
+            pass
 
 
 class MainHandler(tornado.web.RequestHandler):
     def get(self):
-        self.render("index.html", messages=ChatSocketHandler.cache)
+        self.redirect("/static/html/index.html")
+
 
 class LeapSocketHandler(tornado.websocket.WebSocketHandler):
     waiters = set()
-    cache = []
-    cache_size = 200
 
     def allow_draft76(self):
         # for iOS 5.0 Safari
@@ -60,39 +168,25 @@ class LeapSocketHandler(tornado.websocket.WebSocketHandler):
         LeapSocketHandler.waiters.remove(self)
 
     @classmethod
-    def update_cache(cls, chat):
-        cls.cache.append(chat)
-        if len(cls.cache) > cls.cache_size:
-            cls.cache = cls.cache[-cls.cache_size:]
-
-    @classmethod
     def send_updates(cls, chat):
-        logging.info("sending message to %d waiters", len(cls.waiters))
+        if cls.waiters:
+            logger.debug("sending message to %d waiters", len(cls.waiters))
         for waiter in cls.waiters:
             try:
                 waiter.write_message(chat)
             except:
-                logging.error("Error sending message", exc_info=True)
-
-    def on_message(self, message):
-        logging.info("got message %r", message)
-        parsed = tornado.escape.json_decode(message)
-        chat = {
-            "id": str(uuid.uuid4()),
-            "body": parsed["body"],
-            }
-        chat["html"] = self.render_string("message.html", message=chat)
-
-        LeapSocketHandler.update_cache(chat)
-        LeapSocketHandler.send_updates(chat)
+                logger.error("Error sending message", exc_info=True)
 
 
 def main():
+    logging.basicConfig(level=logging.INFO)
+    tornado.options.define("port", default=8888, help="run on the given port", type=int)
     tornado.options.parse_command_line()
     app = Application()
     app.listen(tornado.options.options.port)
+    print "%s listening on http://%s:%s" % (__file__, "0.0.0.0", tornado.options.options.port)
+    print "ctrl-c to stop!"
     tornado.ioloop.IOLoop.instance().start()
-
 
 if __name__ == "__main__":
     main()
